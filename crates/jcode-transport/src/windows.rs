@@ -340,7 +340,16 @@ impl io::Write for SyncStream {
 
 pub fn is_socket_path(path: &Path) -> bool {
     let pipe_name = path_to_pipe_name(path);
-    match ClientOptions::new().open(&pipe_name) {
+    // Probe with a plain `CreateFile`. `ClientOptions::open` registers the
+    // handle with the Tokio IO driver as soon as the pipe exists, so probing a
+    // live endpoint from an ordinary thread (the SDK's `ensure_runtime`, called
+    // from Jcode Desktop's startup thread) panicked with "there is no reactor
+    // running" exactly when the runtime was already up.
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pipe_name)
+    {
         Ok(_) => true,
         Err(error)
             if error.raw_os_error()
@@ -357,7 +366,13 @@ pub fn is_socket_path(path: &Path) -> bool {
 
 pub fn remove_socket(path: &Path) {
     let pipe_name = path_to_pipe_name(path);
-    if ClientOptions::new().open(&pipe_name).is_ok() {
+    // Same reactor-free probe: this also runs outside an async context.
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pipe_name)
+        .is_ok()
+    {
         eprintln!(
             "[windows] Named pipe {} still open, will be replaced by new server",
             pipe_name
@@ -473,5 +488,42 @@ mod tests {
             is_socket_path(&path),
             "a busy named pipe must still be recognized as a live server endpoint"
         );
+    }
+
+    /// Deliberately not a `#[tokio::test]`: the SDK probes the socket from an
+    /// ordinary thread, which is exactly where the Tokio-based probe panicked.
+    #[test]
+    fn socket_path_probe_works_without_a_tokio_runtime() {
+        let path = std::env::temp_dir().join(format!(
+            "jcode-probe-no-reactor-{}-{}.sock",
+            std::process::id(),
+            BUSY_PIPE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert!(
+            !is_socket_path(&path),
+            "an absent pipe must report false rather than panic"
+        );
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (stop_tx, stop_rx) = std::sync::mpsc::sync_channel(0);
+        let server_path = path.clone();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build named-pipe runtime");
+            let _guard = runtime.enter();
+            let _listener = Listener::bind(&server_path).expect("bind named pipe");
+            ready_tx.send(()).expect("announce named pipe");
+            stop_rx.recv().expect("wait for probe");
+        });
+
+        ready_rx.recv().expect("wait for named pipe");
+        assert!(
+            is_socket_path(&path),
+            "a live pipe must be recognized without a Tokio runtime"
+        );
+        stop_tx.send(()).expect("stop named-pipe server");
+        server.join().expect("join named-pipe server");
     }
 }
