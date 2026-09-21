@@ -10,7 +10,7 @@ description = "Local IPC transport: Unix sockets, or Windows named pipes behind 
 # stay free of the application foundation, and duplicating 450 lines of named
 # pipe handling into it would have been the other way to get there.
 [dependencies]
-tokio = { version = "1", features = ["io-util", "net", "time"] }
+tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 sha2 = "0.10"

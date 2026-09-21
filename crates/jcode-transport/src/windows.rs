@@ -294,47 +294,99 @@ impl<'a> AsyncWrite for SplitWriteRef<'a> {
     }
 }
 
-/// Synchronous named pipe stream for blocking IPC (used by communicate tool).
+/// Synchronous named pipe stream for blocking IPC.
+///
+/// A blocking client reads on one thread while another writes, so `try_clone`
+/// must produce halves that make progress independently. Two `std::fs::File`
+/// handles on one synchronous pipe do not: Windows serializes their blocking
+/// I/O, so a reader parked before the first request keeps the writer's bytes
+/// from ever reaching the server. The SDK starts exactly that way, which left
+/// the desktop app connected but unable to fetch any session history.
+///
+/// Keep one native pipe and hand the halves out through a private runtime,
+/// which gives genuinely independent read and write paths.
 pub struct SyncStream {
-    handle: std::fs::File,
+    shared: std::sync::Arc<SyncStreamShared>,
+}
+
+struct SyncStreamShared {
+    runtime: tokio::runtime::Runtime,
+    reader: std::sync::Mutex<ReadHalf>,
+    writer: std::sync::Mutex<WriteHalf>,
 }
 
 impl SyncStream {
     pub fn connect(path: &Path) -> io::Result<Self> {
-        use std::fs::OpenOptions;
         let pipe_name = path_to_pipe_name(path);
-        let file = OpenOptions::new().read(true).write(true).open(&pipe_name)?;
-        Ok(Self { handle: file })
+        // One worker thread is enough: reads and writes are independent
+        // operations on the same pipe, never nested inside one another.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?;
+        let stream = {
+            let _guard = runtime.enter();
+            Stream::Client(ClientOptions::new().open(&pipe_name)?)
+        };
+        let (reader, writer) = stream.into_split();
+        Ok(Self {
+            shared: std::sync::Arc::new(SyncStreamShared {
+                runtime,
+                reader: std::sync::Mutex::new(reader),
+                writer: std::sync::Mutex::new(writer),
+            }),
+        })
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
-            handle: self.handle.try_clone()?,
+            shared: std::sync::Arc::clone(&self.shared),
         })
     }
 
     pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
         let _ = timeout;
-        // std::fs::File-backed named pipes do not expose socket-style read timeouts.
-        // The communicate tool only uses this to avoid hanging forever; on Windows
-        // we currently rely on the server side to respond promptly.
+        // Named pipes do not expose socket-style read timeouts. The communicate
+        // tool only uses this to avoid hanging forever; on Windows we rely on
+        // the server side to respond promptly.
         Ok(())
     }
 }
 
 impl io::Read for SyncStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.handle.read(buf)
+        let mut reader = self
+            .shared
+            .reader
+            .lock()
+            .map_err(|_| io::Error::other("named-pipe reader lock poisoned"))?;
+        self.shared
+            .runtime
+            .block_on(tokio::io::AsyncReadExt::read(&mut *reader, buf))
     }
 }
 
 impl io::Write for SyncStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.handle.write(buf)
+        let mut writer = self
+            .shared
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("named-pipe writer lock poisoned"))?;
+        self.shared
+            .runtime
+            .block_on(tokio::io::AsyncWriteExt::write(&mut *writer, buf))
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.handle.flush()
+        let mut writer = self
+            .shared
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("named-pipe writer lock poisoned"))?;
+        self.shared
+            .runtime
+            .block_on(tokio::io::AsyncWriteExt::flush(&mut *writer))
     }
 }
 
@@ -525,5 +577,67 @@ mod tests {
         );
         stop_tx.send(()).expect("stop named-pipe server");
         server.join().expect("join named-pipe server");
+    }
+
+    /// The SDK parks a reader thread on the connection before it writes its
+    /// first request, exactly as `JcodeClient` does during its handshake. A
+    /// clone whose blocking reads serialize against the writer strands that
+    /// request forever, which is how the desktop app ended up connected yet
+    /// unable to load any session history.
+    #[test]
+    fn a_parked_reader_clone_does_not_block_the_writer() {
+        use std::io::{Read, Write};
+
+        let path = std::env::temp_dir().join(format!(
+            "jcode-duplex-pipe-probe-{}-{}.sock",
+            std::process::id(),
+            BUSY_PIPE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let server_path = path.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build server runtime");
+            runtime.block_on(async move {
+                let mut listener = Listener::bind(&server_path).expect("bind named pipe");
+                ready_tx.send(()).expect("announce named pipe");
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let mut request = [0u8; 4];
+                tokio::io::AsyncReadExt::read_exact(&mut stream, &mut request)
+                    .await
+                    .expect("read request");
+                assert_eq!(&request, b"ping");
+                tokio::io::AsyncWriteExt::write_all(&mut stream, b"pong")
+                    .await
+                    .expect("write reply");
+                tokio::io::AsyncWriteExt::flush(&mut stream)
+                    .await
+                    .expect("flush reply");
+            });
+        });
+
+        ready_rx.recv().expect("wait for named pipe");
+        let mut reader = SyncStream::connect(&path).expect("connect");
+        let mut writer = reader.try_clone().expect("clone connection");
+        let (parked_tx, parked_rx) = std::sync::mpsc::sync_channel(0);
+        let read = std::thread::spawn(move || {
+            parked_tx.send(()).expect("announce parked reader");
+            let mut reply = [0u8; 4];
+            reader.read_exact(&mut reply).expect("read reply");
+            reply
+        });
+
+        parked_rx.recv().expect("reader parked");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        writer.write_all(b"ping").expect("write request");
+        writer.flush().expect("flush request");
+        assert_eq!(
+            &read.join().expect("join reader"),
+            b"pong",
+            "a request written while a clone is parked on read must still reach the server"
+        );
+        server.join().expect("join server");
     }
 }
